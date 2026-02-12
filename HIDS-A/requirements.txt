@@ -1,0 +1,4 @@
+psutil>=5.9.0
+watchdog>=2.2.0
+pytest>=7.0.0
+python-dotenv
