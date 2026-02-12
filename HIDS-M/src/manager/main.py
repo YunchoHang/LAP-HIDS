@@ -11,10 +11,9 @@ PORT = int(os.getenv("HIDS_MANAGER_PORT", "5055"))
 DB_PATH = os.getenv("HIDS_DB_PATH", "hids_events.db")
 
 # PSK must match agent's PSK
-PSK_HEX = os.getenv(
-    "HIDS_PSK",
-    "8b5ffcc63494672c8f5f9ad6966832e7bcee6445e8bfa7241e22b2136174b76f"
-)
+PSK_HEX = os.getenv("HIDS_PSK", "").strip()
+if not PSK_HEX:
+    raise RuntimeError("HIDS_PSK not set (load it from .env or environment)")
 
 # Setup logging
 logging.basicConfig(
