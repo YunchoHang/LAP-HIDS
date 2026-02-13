@@ -1,7 +1,12 @@
 from __future__ import annotations
+
+from dotenv import load_dotenv
+load_dotenv()
+
 import threading
 import logging
 import os
+
 from manager.receiver import run_receiver
 from manager.gui import ManagerGUI
 
@@ -18,11 +23,11 @@ if not PSK_HEX:
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.FileHandler("hids_manager.log"),
-        logging.StreamHandler()
-    ]
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -30,23 +35,19 @@ def main():
     logger.info("HIDS Manager starting...")
     logger.info(f"Listening on {HOST}:{PORT}")
     logger.info(f"Database: {DB_PATH}")
-    
+
     # Start receiver in background thread
     t = threading.Thread(
         target=run_receiver,
         args=(HOST, PORT, PSK_HEX, DB_PATH),
-        daemon=True
+        daemon=True,
     )
     t.start()
     logger.info("Receiver thread started")
-    
+
     # Start GUI
-    try:
-        app = ManagerGUI(DB_PATH)
-        app.mainloop()
-    except Exception as e:
-        logger.error(f"GUI error: {e}", exc_info=True)
-        raise
+    app = ManagerGUI(DB_PATH)
+    app.mainloop()
 
 if __name__ == "__main__":
     main()

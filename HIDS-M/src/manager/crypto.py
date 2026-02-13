@@ -1,5 +1,5 @@
-from __future__ import annotations
-import hmac, hashlib
+import hmac
+import hashlib
 
 def sign_hmac_sha256(psk: bytes, msg: bytes) -> str:
     return hmac.new(psk, msg, hashlib.sha256).hexdigest()
