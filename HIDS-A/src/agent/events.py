@@ -1,4 +1,3 @@
-from __future__ import annotations
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -25,7 +24,6 @@ class Event:
         details: Dict[str, Any] | None = None,
         severity: str = "INFO"
     ) -> "Event":
-        """Create a new event with current timestamp."""
         return Event(
             ts=Event.now_iso(),
             source=source,
@@ -36,14 +34,9 @@ class Event:
         )
 
     def to_json(self) -> str:
-        """Serialize event to JSON string."""
         return json.dumps(asdict(self), separators=(",", ":"), sort_keys=True, ensure_ascii=False)
 
     @staticmethod
     def from_json(s: str) -> "Event":
-        """Deserialize event from JSON string."""
         obj = json.loads(s)
         return Event(**obj)
-
-    def __repr__(self) -> str:
-        return f"Event({self.ts}, {self.kind}, {self.severity}, {self.summary})"

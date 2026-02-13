@@ -9,7 +9,7 @@ if not PSK_HEX:
 
 # Manager targets - update these to your actual Windows machine IPs
 MANAGER_TARGETS = [
-    (os.getenv("HIDS_MANAGER_LAN", "192.168.0.101"), int(os.getenv("HIDS_MANAGER_PORT", "5055"))),
+    (os.getenv("HIDS_MANAGER_LAN", "192.168.0.103"), int(os.getenv("HIDS_MANAGER_PORT", "5055"))),
     (os.getenv("HIDS_MANAGER_REMOTE", "100.83.22.62"), int(os.getenv("HIDS_MANAGER_PORT", "5055"))),
 ]
 

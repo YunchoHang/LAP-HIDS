@@ -1,28 +1,19 @@
-from __future__ import annotations
 import socket
 import time
 import logging
 from typing import List, Tuple
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("hids_agent.net")
 
 class TcpFailoverClient:
-    """TCP client with automatic failover to multiple targets."""
-    
-    def __init__(
-        self,
-        targets: List[Tuple[str, int]],
-        timeout_sec: float = 5.0,
-        retry_delay_sec: float = 2.0
-    ):
+    def __init__(self, targets: List[Tuple[str, int]], timeout_sec: float = 5.0, retry_delay_sec: float = 2.0):
         self.targets = targets
         self.timeout_sec = timeout_sec
         self.retry_delay_sec = retry_delay_sec
-        self.sock: socket.socket | None = None
-        self.connected_to: Tuple[str, int] | None = None
+        self.sock = None
+        self.connected_to = None
 
-    def connect(self) -> None:
-        """Connect to first available target with exponential backoff."""
+    def connect(self):
         backoff = self.retry_delay_sec
         while True:
             for host, port in self.targets:
@@ -44,17 +35,14 @@ class TcpFailoverClient:
                         pass
                     self.sock = None
                     self.connected_to = None
-            
             logger.warning(f"All targets unreachable, retrying in {backoff}s")
             time.sleep(backoff)
-            backoff = min(backoff * 1.5, 30)  # Cap at 30s
+            backoff = min(backoff * 1.5, 30)
 
-    def send_line(self, line: bytes) -> None:
-        """Send a line of data, reconnecting if necessary."""
+    def send_line(self, line: bytes):
         if not self.sock:
             self.connect()
         assert self.sock is not None
-        
         try:
             self.sock.sendall(line)
             logger.debug(f"Sent {len(line)} bytes to {self.connected_to}")
@@ -70,8 +58,7 @@ class TcpFailoverClient:
             assert self.sock is not None
             self.sock.sendall(line)
 
-    def close(self) -> None:
-        """Close the connection."""
+    def close(self):
         if self.sock:
             try:
                 self.sock.close()
