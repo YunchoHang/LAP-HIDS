@@ -10,10 +10,11 @@ import subprocess
 import time
 from typing import Dict, Tuple, Optional
 
+from agent.filewatch import FileWatcher
 from agent.config import (
     MANAGER_TARGETS, PSK_HEX, AUTH_LOG, WATCH_PATHS,
     INTEGRITY_INTERVAL_SEC, PROCESS_INTERVAL_SEC, AUTH_LOG_INTERVAL_SEC,
-    LOG_DIR, LOG_LEVEL, FAILED_LOGIN_THRESHOLD, SUSPICIOUS_PROCESSES
+    LOG_DIR, LOG_LEVEL, FAILED_LOGIN_THRESHOLD, SUSPICIOUS_PROCESSES,
 )
 from agent.crypto import sign_hmac_sha256
 from agent.events import Event
@@ -36,7 +37,6 @@ logger = logging.getLogger(__name__)
 
 # ---------------- Helpers ----------------
 def _extract_ipv4(text: str) -> Optional[str]:
-    # Simple IPv4 extractor (good enough for auth.log lines)
     parts = text.replace("(", " ").replace(")", " ").replace("[", " ").replace("]", " ").split()
     for p in parts:
         if p.count(".") == 3:
@@ -56,14 +56,15 @@ class HIDSAgent:
     Agent monitors:
       - suspicious processes
       - auth log failures
-      - basic file integrity changes
+      - real-time filesystem events (watchdog)
+      - optional periodic file integrity hashing
     Sends signed events to manager.
     """
 
     # Cooldown to avoid spamming the same process alert repeatedly
     PROC_ALERT_COOLDOWN_SEC = 120  # 2 minutes
 
-    # File scanning safety limits (prevents hashing huge files forever)
+    # File hashing safety limits
     MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
     SKIP_DIRS = {".git", "__pycache__", ".cache", "node_modules", "venv", ".venv", "proc", "sys", "dev", "run"}
 
@@ -75,20 +76,20 @@ class HIDSAgent:
         # Auth log tail position
         self.last_auth_pos = 0
 
-        # Process alert dedupe: (pid, suspicious_token) -> last_alert_ts
+        # Dedup for process alerts: (pid, token) -> last_alert_ts
         self.seen_proc_alerts: Dict[Tuple[str, str], float] = {}
 
-        # File integrity: path -> last_hash
+        # File integrity hashes: path -> sha256
         self.file_hashes: Dict[str, str] = {}
 
         # Normalize suspicious tokens once
         self.suspicious_tokens = [s.lower() for s in SUSPICIOUS_PROCESSES]
 
+        # Real-time filesystem watcher
+        self.filewatch = FileWatcher(paths=WATCH_PATHS, send=self.send_simple, recursive=True)
+
+    # ---- Sending / signing ----
     def make_envelope(self, event: Event) -> bytes:
-        """
-        Create signed envelope for event.
-        Avoid double json conversions: use dict once.
-        """
         event_dict = json.loads(event.to_json())
         msg = json.dumps(event_dict, separators=(",", ":"), sort_keys=True).encode()
         sig = sign_hmac_sha256(self.psk, msg)
@@ -96,11 +97,6 @@ class HIDSAgent:
         return (json.dumps(env) + "\n").encode()
 
     def send_event(self, event: Event) -> None:
-        """
-        Apply severity classification (unless already set by creator),
-        then send to manager.
-        """
-        # If event already has severity, keep it; otherwise classify
         sev = event.severity if getattr(event, "severity", None) else classify_severity(event)
         event = Event(
             ts=event.ts,
@@ -110,14 +106,24 @@ class HIDSAgent:
             summary=event.summary,
             details=event.details,
         )
-
         try:
             self.client.send_line(self.make_envelope(event))
             logger.info(f"Sent: {event.kind} ({event.severity})")
         except Exception as e:
             logger.error(f"Failed to send event: {e}", exc_info=True)
 
-    # -------- Process monitoring --------
+    # Callback for FileWatcher
+    def send_simple(self, kind: str, summary: str, details: dict, severity: str = "INFO") -> None:
+        e = Event.create(
+            source="agent",
+            kind=kind,
+            summary=summary,
+            details=details,
+            severity=severity,
+        )
+        self.send_event(e)
+
+    # ---- Process monitoring ----
     def monitor_processes(self) -> None:
         try:
             result = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
@@ -142,11 +148,9 @@ class HIDSAgent:
                         key = (pid, token)
                         last = self.seen_proc_alerts.get(key, 0.0)
                         if _now() - last < self.PROC_ALERT_COOLDOWN_SEC:
-                            # Cooldown: don't spam
                             break
 
                         self.seen_proc_alerts[key] = _now()
-
                         e = Event.create(
                             source="agent",
                             kind="proc_suspicious",
@@ -157,14 +161,13 @@ class HIDSAgent:
                         self.send_event(e)
                         break
 
-            # Optional: prune old dedupe entries (keep dict small)
             cutoff = _now() - (self.PROC_ALERT_COOLDOWN_SEC * 10)
             self.seen_proc_alerts = {k: v for k, v in self.seen_proc_alerts.items() if v >= cutoff}
 
         except Exception as e:
             logger.error(f"Process monitoring error: {e}", exc_info=True)
 
-    # -------- Auth log monitoring --------
+    # ---- Auth log monitoring ----
     def monitor_auth_log(self) -> None:
         try:
             if not os.path.exists(AUTH_LOG):
@@ -200,15 +203,13 @@ class HIDSAgent:
         except Exception as e:
             logger.error(f"Auth log monitoring error: {e}", exc_info=True)
 
-    # -------- File integrity monitoring --------
+    # ---- Optional periodic file hashing (useful for /etc; can be noisy for /home) ----
     def _hash_file_sha256(self, filepath: str) -> Optional[str]:
         import hashlib
-
         try:
             st = os.stat(filepath)
             if st.st_size > self.MAX_FILE_BYTES:
-                return None  # skip huge files
-
+                return None
             h = hashlib.sha256()
             with open(filepath, "rb") as f:
                 for chunk in iter(lambda: f.read(1024 * 1024), b""):
@@ -221,16 +222,13 @@ class HIDSAgent:
         try:
             for watch_path in WATCH_PATHS:
                 if not os.path.exists(watch_path):
-                    logger.warning(f"Watch path not found: {watch_path}")
                     continue
 
                 for root, dirs, files in os.walk(watch_path):
-                    # skip noisy dirs
                     dirs[:] = [d for d in dirs if d not in self.SKIP_DIRS]
 
                     for fname in files:
                         filepath = os.path.join(root, fname)
-
                         new_hash = self._hash_file_sha256(filepath)
                         if not new_hash:
                             continue
@@ -251,13 +249,13 @@ class HIDSAgent:
         except Exception as e:
             logger.error(f"File integrity monitoring error: {e}", exc_info=True)
 
-    # -------- Startup / loop --------
+    # ---- Startup / loop ----
     def startup_event(self) -> None:
         e = Event.create(
             source="agent",
             kind="agent_started",
             summary="HIDS Agent started",
-            details={"targets": MANAGER_TARGETS, "watch_paths": WATCH_PATHS, "version": "1.1"},
+            details={"targets": MANAGER_TARGETS, "watch_paths": WATCH_PATHS, "version": "1.2"},
             severity="INFO",
         )
         self.send_event(e)
@@ -265,6 +263,12 @@ class HIDSAgent:
     def run(self) -> None:
         logger.info("HIDS Agent starting...")
         self.startup_event()
+
+        # Start real-time file watcher
+        try:
+            self.filewatch.start()
+        except Exception as e:
+            logger.error(f"Filewatch failed to start: {e}", exc_info=True)
 
         last_process_check = 0.0
         last_auth_check = 0.0
@@ -282,6 +286,7 @@ class HIDSAgent:
                     self.monitor_auth_log()
                     last_auth_check = now
 
+                # If you feel you get duplicates/noise, comment this block out
                 if now - last_integrity_check >= INTEGRITY_INTERVAL_SEC:
                     self.monitor_file_integrity()
                     last_integrity_check = now
@@ -293,6 +298,10 @@ class HIDSAgent:
         except Exception as e:
             logger.error(f"Agent error: {e}", exc_info=True)
         finally:
+            try:
+                self.filewatch.stop()
+            except Exception:
+                pass
             try:
                 self.client.close()
             except Exception:
