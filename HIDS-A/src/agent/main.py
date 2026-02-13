@@ -46,6 +46,18 @@ def _extract_ipv4(text: str) -> Optional[str]:
     return None
 
 
+def _extract_user_from_accepted(line: str) -> str:
+    # Example: "Accepted password for styx from 1.2.3.4 port 12345 ssh2"
+    parts = line.split()
+    try:
+        i = parts.index("for")
+        if i + 1 < len(parts):
+            return parts[i + 1]
+    except ValueError:
+        pass
+    return "unknown"
+
+
 def _now() -> float:
     return time.time()
 
@@ -55,7 +67,7 @@ class HIDSAgent:
     """
     Agent monitors:
       - suspicious processes
-      - auth log failures
+      - auth log failures + success logins
       - real-time filesystem events (watchdog)
       - optional periodic file integrity hashing
     Sends signed events to manager.
@@ -63,6 +75,9 @@ class HIDSAgent:
 
     # Cooldown to avoid spamming the same process alert repeatedly
     PROC_ALERT_COOLDOWN_SEC = 120  # 2 minutes
+
+    # Cooldown to avoid spamming success-login alerts per IP
+    LOGIN_SUCCESS_COOLDOWN_SEC = 30  # 30 seconds per IP
 
     # File hashing safety limits
     MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
@@ -78,6 +93,12 @@ class HIDSAgent:
 
         # Dedup for process alerts: (pid, token) -> last_alert_ts
         self.seen_proc_alerts: Dict[Tuple[str, str], float] = {}
+
+        # Dedup for successful login alerts: ip -> last_alert_ts
+        self.seen_login_success: Dict[str, float] = {}
+
+        # Track known IPs (for "new IP/device" alert)
+        self.known_ips: set[str] = set()
 
         # File integrity hashes: path -> sha256
         self.file_hashes: Dict[str, str] = {}
@@ -167,7 +188,7 @@ class HIDSAgent:
         except Exception as e:
             logger.error(f"Process monitoring error: {e}", exc_info=True)
 
-    # ---- Auth log monitoring ----
+    # ---- Auth log monitoring (fail + success) ----
     def monitor_auth_log(self) -> None:
         try:
             if not os.path.exists(AUTH_LOG):
@@ -185,6 +206,32 @@ class HIDSAgent:
             failed_ips: Dict[str, int] = {}
 
             for line in new_lines:
+                # ---- SUCCESSFUL SSH/SFTP LOGIN ----
+                if "Accepted password" in line or "Accepted publickey" in line:
+                    ip = _extract_ipv4(line) or "unknown"
+                    user = _extract_user_from_accepted(line)
+
+                    last = self.seen_login_success.get(ip, 0.0)
+                    if _now() - last >= self.LOGIN_SUCCESS_COOLDOWN_SEC:
+                        self.seen_login_success[ip] = _now()
+
+                        is_new_ip = (ip != "unknown") and (ip not in self.known_ips)
+                        if ip != "unknown":
+                            self.known_ips.add(ip)
+
+                        kind = "ssh_login_success_new_ip" if is_new_ip else "ssh_login_success"
+                        severity = "WARN" if is_new_ip else "INFO"
+
+                        e = Event.create(
+                            source="agent",
+                            kind=kind,
+                            summary=f"Successful SSH/SFTP login for {user} from {ip}",
+                            details={"user": user, "ip": ip, "raw": line.strip()},
+                            severity=severity,
+                        )
+                        self.send_event(e)
+
+                # ---- FAILED LOGINS ----
                 if "Failed password" in line or "Invalid user" in line:
                     ip = _extract_ipv4(line) or "unknown"
                     failed_ips[ip] = failed_ips.get(ip, 0) + 1
@@ -199,6 +246,10 @@ class HIDSAgent:
                         severity="HIGH" if count >= (FAILED_LOGIN_THRESHOLD * 2) else "WARN",
                     )
                     self.send_event(e)
+
+            # prune old success entries occasionally
+            cutoff = _now() - (self.LOGIN_SUCCESS_COOLDOWN_SEC * 20)
+            self.seen_login_success = {ip: ts for ip, ts in self.seen_login_success.items() if ts >= cutoff}
 
         except Exception as e:
             logger.error(f"Auth log monitoring error: {e}", exc_info=True)
@@ -255,7 +306,7 @@ class HIDSAgent:
             source="agent",
             kind="agent_started",
             summary="HIDS Agent started",
-            details={"targets": MANAGER_TARGETS, "watch_paths": WATCH_PATHS, "version": "1.2"},
+            details={"targets": MANAGER_TARGETS, "watch_paths": WATCH_PATHS, "version": "1.3"},
             severity="INFO",
         )
         self.send_event(e)
