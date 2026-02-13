@@ -1,14 +1,17 @@
+from __future__ import annotations
+
 from dotenv import load_dotenv
 load_dotenv()
-from __future__ import annotations
+
 import json
 import logging
 import threading
 import time
 import os
 import subprocess
+
 from agent.config import (
-    MANAGER_TARGETS, PSK_HEX, AUTH_LOG, WATCH_PATHS, 
+    MANAGER_TARGETS, PSK_HEX, AUTH_LOG, WATCH_PATHS,
     INTEGRITY_INTERVAL_SEC, PROCESS_INTERVAL_SEC, AUTH_LOG_INTERVAL_SEC,
     LOG_DIR, LOG_LEVEL, FAILED_LOGIN_THRESHOLD
 )
@@ -16,6 +19,7 @@ from agent.crypto import sign_hmac_sha256
 from agent.events import Event
 from agent.net import TcpFailoverClient
 from agent.rules import classify_severity
+
 
 # Setup logging
 os.makedirs(LOG_DIR, exist_ok=True)
