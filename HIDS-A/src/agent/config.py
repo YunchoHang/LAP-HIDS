@@ -19,7 +19,15 @@ MANAGER_TARGETS = [
 
 # Linux monitoring paths
 AUTH_LOG = os.getenv("HIDS_AUTH_LOG", "/var/log/auth.log")
-WATCH_PATHS = [p.strip() for p in os.getenv("HIDS_WATCH_PATHS", "/etc,/usr/bin,/usr/sbin").split(",") if p.strip()]
+
+# Default paths include your home directory
+DEFAULT_WATCH_PATHS = "/home/styx,/etc,/usr/bin,/usr/sbin"
+
+WATCH_PATHS = [
+    p.strip()
+    for p in os.getenv("HIDS_WATCH_PATHS", DEFAULT_WATCH_PATHS).split(",")
+    if p.strip()
+]
 
 # Avoid false positives: shells are everywhere; use tool-like suspects instead
 SUSPICIOUS_PROCESSES = [p.strip().lower() for p in os.getenv(
