@@ -5,15 +5,15 @@ load_dotenv()
 
 import json
 import logging
-import threading
-import time
 import os
 import subprocess
+import time
+from typing import Dict, Tuple, Optional
 
 from agent.config import (
     MANAGER_TARGETS, PSK_HEX, AUTH_LOG, WATCH_PATHS,
     INTEGRITY_INTERVAL_SEC, PROCESS_INTERVAL_SEC, AUTH_LOG_INTERVAL_SEC,
-    LOG_DIR, LOG_LEVEL, FAILED_LOGIN_THRESHOLD
+    LOG_DIR, LOG_LEVEL, FAILED_LOGIN_THRESHOLD, SUSPICIOUS_PROCESSES
 )
 from agent.crypto import sign_hmac_sha256
 from agent.events import Event
@@ -21,217 +21,287 @@ from agent.net import TcpFailoverClient
 from agent.rules import classify_severity
 
 
-# Setup logging
+# ---------------- Logging ----------------
 os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(f"{LOG_DIR}/agent.log"),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler(os.path.join(LOG_DIR, "agent.log")),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
+
+# ---------------- Helpers ----------------
+def _extract_ipv4(text: str) -> Optional[str]:
+    # Simple IPv4 extractor (good enough for auth.log lines)
+    parts = text.replace("(", " ").replace(")", " ").replace("[", " ").replace("]", " ").split()
+    for p in parts:
+        if p.count(".") == 3:
+            octets = p.split(".")
+            if len(octets) == 4 and all(o.isdigit() and 0 <= int(o) <= 255 for o in octets):
+                return p
+    return None
+
+
+def _now() -> float:
+    return time.time()
+
+
+# ---------------- Agent ----------------
 class HIDSAgent:
+    """
+    Agent monitors:
+      - suspicious processes
+      - auth log failures
+      - basic file integrity changes
+    Sends signed events to manager.
+    """
+
+    # Cooldown to avoid spamming the same process alert repeatedly
+    PROC_ALERT_COOLDOWN_SEC = 120  # 2 minutes
+
+    # File scanning safety limits (prevents hashing huge files forever)
+    MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
+    SKIP_DIRS = {".git", "__pycache__", ".cache", "node_modules", "venv", ".venv", "proc", "sys", "dev", "run"}
+
     def __init__(self):
         self.psk = bytes.fromhex(PSK_HEX)
         self.client = TcpFailoverClient(MANAGER_TARGETS)
-        self.running = False
+        self.running = True
+
+        # Auth log tail position
         self.last_auth_pos = 0
-        self.monitored_processes = {}
-        
+
+        # Process alert dedupe: (pid, suspicious_token) -> last_alert_ts
+        self.seen_proc_alerts: Dict[Tuple[str, str], float] = {}
+
+        # File integrity: path -> last_hash
+        self.file_hashes: Dict[str, str] = {}
+
+        # Normalize suspicious tokens once
+        self.suspicious_tokens = [s.lower() for s in SUSPICIOUS_PROCESSES]
+
     def make_envelope(self, event: Event) -> bytes:
-        """Create signed envelope for event."""
-        msg = event.to_json().encode()
+        """
+        Create signed envelope for event.
+        Avoid double json conversions: use dict once.
+        """
+        event_dict = json.loads(event.to_json())
+        msg = json.dumps(event_dict, separators=(",", ":"), sort_keys=True).encode()
         sig = sign_hmac_sha256(self.psk, msg)
-        env = {
-            "sig": sig,
-            "event": json.loads(event.to_json())
-        }
+        env = {"sig": sig, "event": event_dict}
         return (json.dumps(env) + "\n").encode()
-    
+
     def send_event(self, event: Event) -> None:
-        """Send event to manager with severity classification."""
+        """
+        Apply severity classification (unless already set by creator),
+        then send to manager.
+        """
+        # If event already has severity, keep it; otherwise classify
+        sev = event.severity if getattr(event, "severity", None) else classify_severity(event)
         event = Event(
             ts=event.ts,
             source=event.source,
             kind=event.kind,
-            severity=classify_severity(event),
+            severity=sev,
             summary=event.summary,
-            details=event.details
+            details=event.details,
         )
+
         try:
-            envelope = self.make_envelope(event)
-            self.client.send_line(envelope)
+            self.client.send_line(self.make_envelope(event))
             logger.info(f"Sent: {event.kind} ({event.severity})")
         except Exception as e:
-            logger.error(f"Failed to send event: {e}")
-    
+            logger.error(f"Failed to send event: {e}", exc_info=True)
+
+    # -------- Process monitoring --------
     def monitor_processes(self) -> None:
-        """Monitor running processes for suspicious activity."""
         try:
-            result = subprocess.run(
-                ["ps", "aux"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            processes = result.stdout.split('\n')[1:]  # Skip header
-            
-            for line in processes:
+            result = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
+            lines = result.stdout.splitlines()
+            if len(lines) <= 1:
+                return
+
+            for line in lines[1:]:
                 if not line.strip():
                     continue
+
                 parts = line.split()
                 if len(parts) < 11:
                     continue
-                
-                pid, cmd = parts[1], ' '.join(parts[10:])
-                
-                # Check for suspicious commands
-                for suspicious in ["nc", "ncat", "netcat", "/bin/bash", "/bin/sh"]:
-                    if suspicious.lower() in cmd.lower():
+
+                pid = parts[1]
+                cmd = " ".join(parts[10:])
+                cmd_l = cmd.lower()
+
+                for token in self.suspicious_tokens:
+                    if token in cmd_l:
+                        key = (pid, token)
+                        last = self.seen_proc_alerts.get(key, 0.0)
+                        if _now() - last < self.PROC_ALERT_COOLDOWN_SEC:
+                            # Cooldown: don't spam
+                            break
+
+                        self.seen_proc_alerts[key] = _now()
+
                         e = Event.create(
                             source="agent",
                             kind="proc_suspicious",
-                            summary=f"Suspicious process detected: {cmd}",
-                            details={"pid": pid, "command": cmd}
+                            summary=f"Suspicious process token='{token}' detected: {cmd}",
+                            details={"pid": pid, "command": cmd, "match": token},
+                            severity="CRITICAL",
                         )
                         self.send_event(e)
                         break
+
+            # Optional: prune old dedupe entries (keep dict small)
+            cutoff = _now() - (self.PROC_ALERT_COOLDOWN_SEC * 10)
+            self.seen_proc_alerts = {k: v for k, v in self.seen_proc_alerts.items() if v >= cutoff}
+
         except Exception as e:
-            logger.error(f"Process monitoring error: {e}")
-    
+            logger.error(f"Process monitoring error: {e}", exc_info=True)
+
+    # -------- Auth log monitoring --------
     def monitor_auth_log(self) -> None:
-        """Monitor SSH/auth failures."""
         try:
             if not os.path.exists(AUTH_LOG):
                 logger.warning(f"Auth log not found: {AUTH_LOG}")
                 return
-            
-            with open(AUTH_LOG, 'r') as f:
+
+            with open(AUTH_LOG, "r", encoding="utf-8", errors="ignore") as f:
                 f.seek(self.last_auth_pos)
                 new_lines = f.readlines()
                 self.last_auth_pos = f.tell()
-            
-            failed_ips = {}
-            
+
+            if not new_lines:
+                return
+
+            failed_ips: Dict[str, int] = {}
+
             for line in new_lines:
                 if "Failed password" in line or "Invalid user" in line:
-                    # Extract IP if possible
-                    parts = line.split()
-                    ip = "unknown"
-                    for part in parts:
-                        if part.replace(".", "").isdigit() and len(part.split(".")) == 4:
-                            ip = part
-                            break
-                    
+                    ip = _extract_ipv4(line) or "unknown"
                     failed_ips[ip] = failed_ips.get(ip, 0) + 1
-            
+
             for ip, count in failed_ips.items():
                 if count >= FAILED_LOGIN_THRESHOLD:
-                    severity = "HIGH" if count >= 10 else "WARN"
                     e = Event.create(
                         source="agent",
                         kind="ssh_fail",
                         summary=f"Multiple failed SSH attempts from {ip}",
                         details={"ip": ip, "fail_count": count},
-                        severity=severity
+                        severity="HIGH" if count >= (FAILED_LOGIN_THRESHOLD * 2) else "WARN",
                     )
                     self.send_event(e)
+
         except Exception as e:
-            logger.error(f"Auth log monitoring error: {e}")
-    
-    def monitor_file_integrity(self) -> None:
-        """Monitor watched directories for changes."""
+            logger.error(f"Auth log monitoring error: {e}", exc_info=True)
+
+    # -------- File integrity monitoring --------
+    def _hash_file_sha256(self, filepath: str) -> Optional[str]:
+        import hashlib
+
         try:
-            import hashlib
+            st = os.stat(filepath)
+            if st.st_size > self.MAX_FILE_BYTES:
+                return None  # skip huge files
+
+            h = hashlib.sha256()
+            with open(filepath, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except (PermissionError, FileNotFoundError, IsADirectoryError, OSError):
+            return None
+
+    def monitor_file_integrity(self) -> None:
+        try:
             for watch_path in WATCH_PATHS:
                 if not os.path.exists(watch_path):
                     logger.warning(f"Watch path not found: {watch_path}")
                     continue
-                
+
                 for root, dirs, files in os.walk(watch_path):
-                    # Skip common non-critical subdirs
-                    dirs[:] = [d for d in dirs if d not in ['.cache', '__pycache__', '.git']]
-                    
-                    for file in files:
-                        filepath = os.path.join(root, file)
-                        try:
-                            with open(filepath, 'rb') as f:
-                                file_hash = hashlib.sha256(f.read()).hexdigest()
-                            
-                            current_hash = self.monitored_processes.get(filepath)
-                            if current_hash and current_hash != file_hash:
-                                e = Event.create(
-                                    source="agent",
-                                    kind="file_change",
-                                    summary=f"File integrity changed: {filepath}",
-                                    details={"path": filepath, "old_hash": current_hash, "new_hash": file_hash},
-                                    severity="WARN"
-                                )
-                                self.send_event(e)
-                            
-                            self.monitored_processes[filepath] = file_hash
-                        except (PermissionError, OSError):
-                            pass
+                    # skip noisy dirs
+                    dirs[:] = [d for d in dirs if d not in self.SKIP_DIRS]
+
+                    for fname in files:
+                        filepath = os.path.join(root, fname)
+
+                        new_hash = self._hash_file_sha256(filepath)
+                        if not new_hash:
+                            continue
+
+                        old_hash = self.file_hashes.get(filepath)
+                        if old_hash and old_hash != new_hash:
+                            e = Event.create(
+                                source="agent",
+                                kind="file_change",
+                                summary=f"File integrity changed: {filepath}",
+                                details={"path": filepath, "old_hash": old_hash, "new_hash": new_hash},
+                                severity="WARN",
+                            )
+                            self.send_event(e)
+
+                        self.file_hashes[filepath] = new_hash
+
         except Exception as e:
-            logger.error(f"File integrity monitoring error: {e}")
-    
+            logger.error(f"File integrity monitoring error: {e}", exc_info=True)
+
+    # -------- Startup / loop --------
     def startup_event(self) -> None:
-        """Send agent startup event."""
         e = Event.create(
             source="agent",
             kind="agent_started",
             summary="HIDS Agent started",
-            details={
-                "targets": MANAGER_TARGETS,
-                "watch_paths": WATCH_PATHS,
-                "version": "1.0"
-            }
+            details={"targets": MANAGER_TARGETS, "watch_paths": WATCH_PATHS, "version": "1.1"},
+            severity="INFO",
         )
         self.send_event(e)
-    
+
     def run(self) -> None:
-        """Main agent loop."""
-        self.running = True
         logger.info("HIDS Agent starting...")
         self.startup_event()
-        
-        last_process_check = 0
-        last_auth_check = 0
-        last_integrity_check = 0
-        
+
+        last_process_check = 0.0
+        last_auth_check = 0.0
+        last_integrity_check = 0.0
+
         try:
             while self.running:
-                now = time.time()
-                
-                # Process monitoring
+                now = _now()
+
                 if now - last_process_check >= PROCESS_INTERVAL_SEC:
                     self.monitor_processes()
                     last_process_check = now
-                
-                # Auth log monitoring
+
                 if now - last_auth_check >= AUTH_LOG_INTERVAL_SEC:
                     self.monitor_auth_log()
                     last_auth_check = now
-                
-                # File integrity monitoring
+
                 if now - last_integrity_check >= INTEGRITY_INTERVAL_SEC:
                     self.monitor_file_integrity()
                     last_integrity_check = now
-                
+
                 time.sleep(1)
+
         except KeyboardInterrupt:
-            logger.info("Agent shutting down...")
+            logger.info("Agent shutting down (Ctrl+C)...")
         except Exception as e:
             logger.error(f"Agent error: {e}", exc_info=True)
         finally:
-            self.client.close()
+            try:
+                self.client.close()
+            except Exception:
+                pass
+
 
 def main():
-    agent = HIDSAgent()
-    agent.run()
+    HIDSAgent().run()
+
 
 if __name__ == "__main__":
     main()
