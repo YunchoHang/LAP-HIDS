@@ -47,7 +47,6 @@ def _extract_ipv4(text: str) -> Optional[str]:
 
 
 def _extract_user_from_accepted(line: str) -> str:
-    # Example: "Accepted password for styx from 1.2.3.4 port 12345 ssh2"
     parts = line.split()
     try:
         i = parts.index("for")
@@ -64,23 +63,11 @@ def _now() -> float:
 
 # ---------------- Agent ----------------
 class HIDSAgent:
-    """
-    Agent monitors:
-      - suspicious processes
-      - auth log failures + success logins
-      - real-time filesystem events (watchdog)
-      - optional periodic file integrity hashing
-    Sends signed events to manager.
-    """
 
-    # Cooldown to avoid spamming the same process alert repeatedly
-    PROC_ALERT_COOLDOWN_SEC = 120  # 2 minutes
+    PROC_ALERT_COOLDOWN_SEC = 120
+    LOGIN_SUCCESS_COOLDOWN_SEC = 30
 
-    # Cooldown to avoid spamming success-login alerts per IP
-    LOGIN_SUCCESS_COOLDOWN_SEC = 30  # 30 seconds per IP
-
-    # File hashing safety limits
-    MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
+    MAX_FILE_BYTES = 5 * 1024 * 1024
     SKIP_DIRS = {".git", "__pycache__", ".cache", "node_modules", "venv", ".venv", "proc", "sys", "dev", "run"}
 
     def __init__(self):
@@ -88,25 +75,17 @@ class HIDSAgent:
         self.client = TcpFailoverClient(MANAGER_TARGETS)
         self.running = True
 
-        # Auth log tail position
-        self.last_auth_pos = 0
+        # Start reading auth log like tail -f
+        self.last_auth_pos = os.path.getsize(AUTH_LOG) if os.path.exists(AUTH_LOG) else 0
 
-        # Dedup for process alerts: (pid, token) -> last_alert_ts
         self.seen_proc_alerts: Dict[Tuple[str, str], float] = {}
-
-        # Dedup for successful login alerts: ip -> last_alert_ts
         self.seen_login_success: Dict[str, float] = {}
 
-        # Track known IPs (for "new IP/device" alert)
         self.known_ips: set[str] = set()
-
-        # File integrity hashes: path -> sha256
         self.file_hashes: Dict[str, str] = {}
 
-        # Normalize suspicious tokens once
         self.suspicious_tokens = [s.lower() for s in SUSPICIOUS_PROCESSES]
 
-        # Real-time filesystem watcher
         self.filewatch = FileWatcher(paths=WATCH_PATHS, send=self.send_simple, recursive=True)
 
     # ---- Sending / signing ----
@@ -127,13 +106,13 @@ class HIDSAgent:
             summary=event.summary,
             details=event.details,
         )
+
         try:
             self.client.send_line(self.make_envelope(event))
             logger.info(f"Sent: {event.kind} ({event.severity})")
         except Exception as e:
             logger.error(f"Failed to send event: {e}", exc_info=True)
 
-    # Callback for FileWatcher
     def send_simple(self, kind: str, summary: str, details: dict, severity: str = "INFO") -> None:
         e = Event.create(
             source="agent",
@@ -149,13 +128,8 @@ class HIDSAgent:
         try:
             result = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
             lines = result.stdout.splitlines()
-            if len(lines) <= 1:
-                return
 
             for line in lines[1:]:
-                if not line.strip():
-                    continue
-
                 parts = line.split()
                 if len(parts) < 11:
                     continue
@@ -166,33 +140,34 @@ class HIDSAgent:
 
                 for token in self.suspicious_tokens:
                     if token in cmd_l:
+
                         key = (pid, token)
-                        last = self.seen_proc_alerts.get(key, 0.0)
+                        last = self.seen_proc_alerts.get(key, 0)
+
                         if _now() - last < self.PROC_ALERT_COOLDOWN_SEC:
                             break
 
                         self.seen_proc_alerts[key] = _now()
+
                         e = Event.create(
                             source="agent",
                             kind="proc_suspicious",
-                            summary=f"Suspicious process token='{token}' detected: {cmd}",
-                            details={"pid": pid, "command": cmd, "match": token},
+                            summary=f"Suspicious process '{token}' detected",
+                            details={"pid": pid, "command": cmd},
                             severity="CRITICAL",
                         )
                         self.send_event(e)
                         break
 
-            cutoff = _now() - (self.PROC_ALERT_COOLDOWN_SEC * 10)
-            self.seen_proc_alerts = {k: v for k, v in self.seen_proc_alerts.items() if v >= cutoff}
-
         except Exception as e:
-            logger.error(f"Process monitoring error: {e}", exc_info=True)
+            logger.error(f"Process monitor error: {e}")
 
-    # ---- Auth log monitoring (fail + success) ----
+    # ---- Auth log monitoring ----
     def monitor_auth_log(self) -> None:
+
         try:
+
             if not os.path.exists(AUTH_LOG):
-                logger.warning(f"Auth log not found: {AUTH_LOG}")
                 return
 
             with open(AUTH_LOG, "r", encoding="utf-8", errors="ignore") as f:
@@ -200,163 +175,164 @@ class HIDSAgent:
                 new_lines = f.readlines()
                 self.last_auth_pos = f.tell()
 
-            if not new_lines:
-                return
-
             failed_ips: Dict[str, int] = {}
 
             for line in new_lines:
-                # ---- SUCCESSFUL SSH/SFTP LOGIN ----
-                if "Accepted password" in line or "Accepted publickey" in line:
+
+                # SUCCESSFUL LOGIN
+                if (
+                    "Accepted password" in line
+                    or "Accepted publickey" in line
+                    or "session opened for user" in line
+                ):
+
                     ip = _extract_ipv4(line) or "unknown"
                     user = _extract_user_from_accepted(line)
 
-                    last = self.seen_login_success.get(ip, 0.0)
-                    if _now() - last >= self.LOGIN_SUCCESS_COOLDOWN_SEC:
+                    last = self.seen_login_success.get(ip, 0)
+
+                    if _now() - last > self.LOGIN_SUCCESS_COOLDOWN_SEC:
+
                         self.seen_login_success[ip] = _now()
 
-                        is_new_ip = (ip != "unknown") and (ip not in self.known_ips)
-                        if ip != "unknown":
-                            self.known_ips.add(ip)
+                        is_new_ip = ip not in self.known_ips
+                        self.known_ips.add(ip)
 
                         kind = "ssh_login_success_new_ip" if is_new_ip else "ssh_login_success"
-                        severity = "WARN" if is_new_ip else "INFO"
 
                         e = Event.create(
                             source="agent",
                             kind=kind,
-                            summary=f"Successful SSH/SFTP login for {user} from {ip}",
-                            details={"user": user, "ip": ip, "raw": line.strip()},
-                            severity=severity,
+                            summary=f"Successful SSH login {user} from {ip}",
+                            details={"user": user, "ip": ip},
+                            severity="WARN" if is_new_ip else "INFO",
                         )
+
                         self.send_event(e)
 
-                # ---- FAILED LOGINS ----
-                if "Failed password" in line or "Invalid user" in line:
+                # FAILED / SCAN DETECTION
+                if (
+                    "Failed password" in line
+                    or "Invalid user" in line
+                    or "authentication failure" in line
+                    or "Connection closed by authenticating user" in line
+                    or "Disconnected from authenticating user" in line
+                ):
+
                     ip = _extract_ipv4(line) or "unknown"
                     failed_ips[ip] = failed_ips.get(ip, 0) + 1
 
             for ip, count in failed_ips.items():
+
                 if count >= FAILED_LOGIN_THRESHOLD:
+
                     e = Event.create(
                         source="agent",
                         kind="ssh_fail",
-                        summary=f"Multiple failed SSH attempts from {ip}",
-                        details={"ip": ip, "fail_count": count},
-                        severity="HIGH" if count >= (FAILED_LOGIN_THRESHOLD * 2) else "WARN",
+                        summary=f"Multiple SSH failures from {ip}",
+                        details={"ip": ip, "count": count},
+                        severity="HIGH" if count >= FAILED_LOGIN_THRESHOLD * 2 else "WARN",
                     )
+
                     self.send_event(e)
 
-            # prune old success entries occasionally
-            cutoff = _now() - (self.LOGIN_SUCCESS_COOLDOWN_SEC * 20)
-            self.seen_login_success = {ip: ts for ip, ts in self.seen_login_success.items() if ts >= cutoff}
-
         except Exception as e:
-            logger.error(f"Auth log monitoring error: {e}", exc_info=True)
+            logger.error(f"Auth monitor error: {e}")
 
-    # ---- Optional periodic file hashing (useful for /etc; can be noisy for /home) ----
-    def _hash_file_sha256(self, filepath: str) -> Optional[str]:
+    # ---- File Integrity ----
+    def monitor_file_integrity(self):
+
         import hashlib
-        try:
-            st = os.stat(filepath)
-            if st.st_size > self.MAX_FILE_BYTES:
-                return None
-            h = hashlib.sha256()
-            with open(filepath, "rb") as f:
-                for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                    h.update(chunk)
-            return h.hexdigest()
-        except (PermissionError, FileNotFoundError, IsADirectoryError, OSError):
-            return None
 
-    def monitor_file_integrity(self) -> None:
         try:
-            for watch_path in WATCH_PATHS:
-                if not os.path.exists(watch_path):
-                    continue
+            for path in WATCH_PATHS:
 
-                for root, dirs, files in os.walk(watch_path):
+                for root, dirs, files in os.walk(path):
+
                     dirs[:] = [d for d in dirs if d not in self.SKIP_DIRS]
 
-                    for fname in files:
-                        filepath = os.path.join(root, fname)
-                        new_hash = self._hash_file_sha256(filepath)
-                        if not new_hash:
+                    for f in files:
+
+                        fp = os.path.join(root, f)
+
+                        try:
+                            if os.path.getsize(fp) > self.MAX_FILE_BYTES:
+                                continue
+
+                            h = hashlib.sha256()
+
+                            with open(fp, "rb") as file:
+                                for chunk in iter(lambda: file.read(4096), b""):
+                                    h.update(chunk)
+
+                            new_hash = h.hexdigest()
+                            old_hash = self.file_hashes.get(fp)
+
+                            if old_hash and old_hash != new_hash:
+
+                                e = Event.create(
+                                    source="agent",
+                                    kind="file_change",
+                                    summary=f"File modified {fp}",
+                                    details={"path": fp},
+                                    severity="WARN",
+                                )
+
+                                self.send_event(e)
+
+                            self.file_hashes[fp] = new_hash
+
+                        except Exception:
                             continue
 
-                        old_hash = self.file_hashes.get(filepath)
-                        if old_hash and old_hash != new_hash:
-                            e = Event.create(
-                                source="agent",
-                                kind="file_change",
-                                summary=f"File integrity changed: {filepath}",
-                                details={"path": filepath, "old_hash": old_hash, "new_hash": new_hash},
-                                severity="WARN",
-                            )
-                            self.send_event(e)
-
-                        self.file_hashes[filepath] = new_hash
-
         except Exception as e:
-            logger.error(f"File integrity monitoring error: {e}", exc_info=True)
+            logger.error(f"Integrity monitor error: {e}")
 
-    # ---- Startup / loop ----
-    def startup_event(self) -> None:
+    # ---- Startup ----
+    def startup_event(self):
+
         e = Event.create(
             source="agent",
             kind="agent_started",
-            summary="HIDS Agent started",
-            details={"targets": MANAGER_TARGETS, "watch_paths": WATCH_PATHS, "version": "1.3"},
+            summary="HIDS agent started",
+            details={"targets": MANAGER_TARGETS},
             severity="INFO",
         )
+
         self.send_event(e)
 
-    def run(self) -> None:
-        logger.info("HIDS Agent starting...")
+    # ---- Main loop ----
+    def run(self):
+
+        logger.info("HIDS Agent starting")
         self.startup_event()
 
-        # Start real-time file watcher
         try:
             self.filewatch.start()
-        except Exception as e:
-            logger.error(f"Filewatch failed to start: {e}", exc_info=True)
+        except Exception:
+            pass
 
-        last_process_check = 0.0
-        last_auth_check = 0.0
-        last_integrity_check = 0.0
+        last_proc = 0
+        last_auth = 0
+        last_integrity = 0
 
-        try:
-            while self.running:
-                now = _now()
+        while self.running:
 
-                if now - last_process_check >= PROCESS_INTERVAL_SEC:
-                    self.monitor_processes()
-                    last_process_check = now
+            now = _now()
 
-                if now - last_auth_check >= AUTH_LOG_INTERVAL_SEC:
-                    self.monitor_auth_log()
-                    last_auth_check = now
+            if now - last_proc >= PROCESS_INTERVAL_SEC:
+                self.monitor_processes()
+                last_proc = now
 
-                # If you feel you get duplicates/noise, comment this block out
-                if now - last_integrity_check >= INTEGRITY_INTERVAL_SEC:
-                    self.monitor_file_integrity()
-                    last_integrity_check = now
+            if now - last_auth >= AUTH_LOG_INTERVAL_SEC:
+                self.monitor_auth_log()
+                last_auth = now
 
-                time.sleep(1)
+            if now - last_integrity >= INTEGRITY_INTERVAL_SEC:
+                self.monitor_file_integrity()
+                last_integrity = now
 
-        except KeyboardInterrupt:
-            logger.info("Agent shutting down (Ctrl+C)...")
-        except Exception as e:
-            logger.error(f"Agent error: {e}", exc_info=True)
-        finally:
-            try:
-                self.filewatch.stop()
-            except Exception:
-                pass
-            try:
-                self.client.close()
-            except Exception:
-                pass
+            time.sleep(1)
 
 
 def main():
